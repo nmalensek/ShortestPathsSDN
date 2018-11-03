@@ -31,6 +31,7 @@ import net.floodlightcontroller.linkdiscovery.ILinkDiscoveryListener;
 import net.floodlightcontroller.linkdiscovery.ILinkDiscoveryService;
 import net.floodlightcontroller.routing.Link;
 import net.floodlightcontroller.packet.Ethernet;
+import net.floodlightcontroller.util.MACAddress;
 
 import org.openflow.protocol.OFMatch;
 import org.openflow.protocol.OFMatchField;
@@ -64,6 +65,8 @@ public class ShortestPathSwitching implements IFloodlightModule, IOFSwitchListen
     
     // Map of hosts to devices
     private Map<IDevice,Host> knownHosts;
+
+    private boolean networkSettled = false;
 
 	/**
      * Loads dependencies and initializes data structures.
@@ -123,6 +126,74 @@ public class ShortestPathSwitching implements IFloodlightModule, IOFSwitchListen
     private Collection<Link> getLinks()
     { return linkDiscProv.getLinks().keySet(); }
 
+	/**
+	* When a new host joins, add a rule to its directly connected switch to send packets to the host in question.
+	*/
+	private void addBaseSwitchToHostConnection(Host host) {
+			if (host.getPort() == null || !host.isAttachedToSwitch()) { return; }
+			//create a match object that says the action defined later applies to ethernet/IPv4 packets from this host
+			OFMatch match = new OFMatch();
+			match.setDataLayerType(Ethernet.TYPE_IPv4);
+			match.setDataLayerDestination(MACAddress.valueOf(host.getMACAddress()).toString());
+ 	
+			//create the output action when a packet matches the match conditions: 
+			//when a packet arrives for this host, send it out the host port
+			OFAction action = new OFActionOutput(host.getPort());
+    			OFInstruction instruction = new OFInstructionApplyActions(Arrays.asList(action));
+
+			//install rule at switch
+    			SwitchCommands.installRule(host.getSwitch(), this.table, SwitchCommands.DEFAULT_PRIORITY,
+  											match, Arrays.asList(instruction));
+	}
+	
+	/**
+	* Clear all switches' flow rules using their convenience method.
+	*/
+	private void clearAllSwitchRules() {
+		for (IOFSwitch s : getSwitches().values()) {
+			s.clearAllFlowMods();
+		}
+	}
+
+	/**
+	* For each host, add a rule to its connected switch to forward packets to the host. 
+	* Then find the shortest path from its connected switch to all other switches in the network.
+	* Then install all of those shortest paths on each applicable switch.
+	*/
+	private void createShortestPaths() {
+			for (Host currentHost : getHosts()) {
+				addBaseSwitchToHostConnection(currentHost);	
+				ShortestPathSearch paths = new ShortestPathSearch();
+				
+				if (!currentHost.isAttachedToSwitch()) { continue; }
+
+				paths.calculateShortestPaths(currentHost.getSwitch(), getLinks(), getSwitches());				
+				for (Host otherHost : getHosts()) {
+	
+					OFMatch match = new OFMatch();
+					match.setDataLayerType(Ethernet.TYPE_IPv4);
+					match.setDataLayerDestination(MACAddress.valueOf(otherHost.getMACAddress()).toString());
+					
+					if (!otherHost.isAttachedToSwitch()) { continue; }
+					Iterable<Link> pathToHost = paths.pathTo(otherHost.getSwitch().getId());
+					for (Link edge : pathToHost) {
+						for (IOFSwitch sw : getSwitches().values()) {
+							if (sw.getId() == edge.getSrc()) {
+								OFAction action = new OFActionOutput(edge.getSrcPort());
+								OFInstruction instruction = 
+									new OFInstructionApplyActions(Arrays.asList(action));
+								SwitchCommands.installRule(
+								sw, this.table, SwitchCommands.DEFAULT_PRIORITY,
+								match, Arrays.asList(instruction));
+							}
+						}
+					}
+				}			
+			}
+	}
+
+
+
     /**
      * Event handler called when a host joins the network.
      * @param device information about the host
@@ -135,97 +206,16 @@ public class ShortestPathSwitching implements IFloodlightModule, IOFSwitchListen
 		if (host.getIPv4Address() != null)
 		{
 			log.info(String.format("Host %s added", host.getName()));
+			log.info("With MAC Address: " + host.getMACAddress());
 			this.knownHosts.put(device, host);
 
-			OFMatch match = addBaseSwitchToHostConnection(host);
 			createShortestPaths();
-			/*****************************************************************/
-			/* TODO: Update routing: add rules to route to new host          */
-			
-			/*****************************************************************/
+			//mininet adds hosts last on startup, so say the network's settled 
+			//once it starts adding hosts
+			if (!networkSettled) { networkSettled = true; }
 		}
 	}
-
-	/**
-	* When a new host joins, add a rule to its directly connected switch to send packets to the host in question.
-	*/
-	private OFMatch addBaseSwitchToHostConnection(Host host) {
-		//create a match object that says the action defined later applies to ethernet/IPv4 packets from this host
-			OFMatch match = new OFMatch();
-    			List<OFMatchField> matchFields = new ArrayList<OFMatchField>();
-    			OFMatchField ethernetIpType = new OFMatchField(OFOXMFieldType.ETH_TYPE, Ethernet.TYPE_IPv4);
-    			OFMatchField toThisHost = new OFMatchField(OFOXMFieldType.IPV4_DST, host.getIPv4Address());
- 		
-			matchFields.add(ethernetIpType);
-			matchFields.add(toThisHost);
-  		
-    			match.setMatchFields(matchFields);
-
-			//create the output action when a packet matches the match conditions: when a packet arrives for this host, send it out the host port
-			OFAction action = new OFActionOutput(host.getPort());
-    			OFInstruction instruction = new OFInstructionApplyActions(Arrays.asList(action));
-
-			//install rule at switch
-    			SwitchCommands.installRule(host.getSwitch(), this.table, SwitchCommands.DEFAULT_PRIORITY,
-  											match, Arrays.asList(instruction));
-		return match;
-	}
-
-	private void clearAllSwitchRules() {
-		for (IOFSwitch s : getSwitches().values()) {
-			s.clearAllFlowMods();
-		}
-	}
-
-	private void createShortestPaths() {
-//		try {
-//			clearAllSwitchRules();
-			for (Host currentHost : getHosts()) {
-//				addBaseSwitchToHostConnection(currentHost);	
-				EdgeWeightedDigraph graph = new EdgeWeightedDigraph(getLinks());
-				
-				//log.info("------------------------------- graph: " + graph + " SWITCH: " + currentHost.getSwitch().getId() + "\n"
-			//		+ "ALL SWITCHES: ");
-			//	for (IOFSwitch s : getSwitches().values()) {
-		//			log.info(s.toString());
-	//			}
-	//			log.info("---------------------------------------");
-				if (currentHost.getSwitch() == null) { log.info(currentHost.getName() + " switch not attached"); continue; }
-				BellmanFordSP paths = new BellmanFordSP(graph, currentHost.getSwitch().getId(), getSwitches());
-				
-				for (Host otherHost : getHosts()) {
 	
-					OFMatch match = new OFMatch();
-    					List<OFMatchField> matchFields = new ArrayList<OFMatchField>();
-    					OFMatchField ethernetIpType = new OFMatchField(OFOXMFieldType.ETH_TYPE, Ethernet.TYPE_IPv4);
-    					OFMatchField toOtherHost = new OFMatchField(OFOXMFieldType.IPV4_DST, otherHost.getIPv4Address());
- 		
-					matchFields.add(ethernetIpType);
-					matchFields.add(toOtherHost);
-  			
-    					match.setMatchFields(matchFields);
-					if (otherHost.getSwitch() == null) { log.info(otherHost.getName() + " switch not attached"); continue; }
-					log.info("Paths: " + paths.pathTo(otherHost.getSwitch().getId()));
-					Iterable<Link> pathToHost = paths.pathTo(otherHost.getSwitch().getId());
-					for (Link edge : pathToHost) {
-						for (IOFSwitch sw : getSwitches().values()) {
-							if (sw.getId() == edge.getSrc()) {
-								OFAction action = new OFActionOutput(edge.getSrcPort());
-								OFInstruction instruction = new OFInstructionApplyActions(Arrays.asList(action));
-								SwitchCommands.installRule(sw, this.table, SwitchCommands.DEFAULT_PRIORITY,
-													match, Arrays.asList(instruction));
-							log.info("Switch " + sw.getId() + " will now forward packets for " + otherHost.getMACAddress() 
-										+ " on port " + edge.getSrcPort());
-							}
-						}
-					}
-				}			
-			}
-//		} catch (NullPointerException npe) {
-//			log.info("Tried to set shortest paths before network was fully settled, aborted.");
-//		}	
-	}
-
 	/**
      * Event handler called when a host is no longer attached to a switch.
      * @param device information about the host
@@ -238,15 +228,13 @@ public class ShortestPathSwitching implements IFloodlightModule, IOFSwitchListen
 		{
 			host = new Host(device, this.floodlightProv);
 			this.knownHosts.put(device, host);
-		}
+		}   	
 		
 		log.info(String.format("Host %s is no longer attached to a switch", 
-				host.getName()));
-//		createShortestPaths();
-		/*********************************************************************/
-		/* TODO: Update routing: remove rules to route to host               */
-		
-		/*********************************************************************/
+				host.getName()));	
+
+		clearAllSwitchRules();
+		createShortestPaths();	
 	}
 
 	/**
@@ -270,11 +258,11 @@ public class ShortestPathSwitching implements IFloodlightModule, IOFSwitchListen
 		}
 		log.info(String.format("Host %s moved to s%d:%d", host.getName(),
 				host.getSwitch().getId(), host.getPort()));
-	createShortestPaths();	
-		/*********************************************************************/
-		/* TODO: Update routing: change rules to route to host               */
-		
-		/*********************************************************************/
+		if (networkSettled) { createShortestPaths(); }	
+		log.info("HOSTS **********************");
+		for (Host h : getHosts()) {
+			log.info("Host : " + h.getName());
+		} 
 	}
 	
     /**
@@ -286,11 +274,9 @@ public class ShortestPathSwitching implements IFloodlightModule, IOFSwitchListen
 	{
 		IOFSwitch sw = this.floodlightProv.getSwitch(switchId);
 		log.info(String.format("Switch s%d added", switchId));
-		createShortestPaths();
-		/*********************************************************************/
-		/* TODO: Update routing: change routing rules for all hosts          */
-
-		/*********************************************************************/
+		if (networkSettled) { 
+			createShortestPaths(); 
+		}
 	}
 
 	/**
@@ -302,11 +288,8 @@ public class ShortestPathSwitching implements IFloodlightModule, IOFSwitchListen
 	{
 		IOFSwitch sw = this.floodlightProv.getSwitch(switchId);
 		log.info(String.format("Switch s%d removed", switchId));
+
 		createShortestPaths();
-		/*********************************************************************/
-		/* TODO: Update routing: change routing rules for all hosts          */
-		
-		/*********************************************************************/
 	}
 
 	/**
@@ -331,17 +314,12 @@ public class ShortestPathSwitching implements IFloodlightModule, IOFSwitchListen
 				log.info(String.format("Link s%s:%d -> s%s:%d updated", 
 					update.getSrc(), update.getSrcPort(),
 					update.getDst(), update.getDstPort()));
+				if (networkSettled) {
+					createShortestPaths();
+				}
 			}
 			
-		createShortestPaths();	
-		}
-//		for (Link link : getLinks()) {
-//			log.info(link.toString());
-//		}
-		/*********************************************************************/
-		/* TODO: Update routing: change routing rules for all hosts          */
-		
-		/*********************************************************************/
+		}	
 	}
 
 	/**
